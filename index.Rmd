@@ -1,0 +1,274 @@
+---
+title: "Final Project: Practical Machine Learning"
+author: "Clay Glad"
+date: "10 September 2020"
+output:
+    html_document:
+        theme: cerulean
+---
+
+```{r setup, include=FALSE, messages=FALSE, warnings=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## The Question
+
+It is common to use wearable devices to measure how much of an activity someone  
+engages in. The Human Activity Recognition Project of Groupware@LES has  
+expanded these metrics to measure *how well* certain activities are performed.  
+In particular, Velloso *et al.* [Velloso, E.; Bulling, A.; Gellersen, H.;  
+Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting   
+Exercises. Proceedings of 4th International Conference in Cooperation with  
+SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.] have  
+defined the quality of  execution in certain weightlifting exercises and used  
+on-body sensing and ambient sensing in order to provide feedback to users on  
+their technique. They classified the results into four categories. Category A  
+indicates correct execution of the exercise, while categories B-E are those of  
+specific errors in execution.
+<br><br>
+Their dataset is robust: nearly 20,000 observations of 160 variables. We propose  
+to develop a machine learning model that when given observations on some  
+subset of these variables can predict into which of the five categories any  
+instance of execution falls.
+
+```{r, chunk1, echo = FALSE, warnings = FALSE, include = FALSE}
+
+# Load libraries
+
+library(caret)
+library(tidyverse)
+library(data.table)
+library(cowplot)
+library(RColorBrewer)
+library(scales)
+# library(nlme)
+# library(mgcv)
+
+# Function to display confusion5 matrices
+
+conMatPlot = function(cfm, model) {
+        plot = ggplot(data = as.data.frame(cfm$table),
+               aes(x = Reference, y = Prediction)) +
+                geom_tile(aes(fill = log(Freq)), color = "white") +
+                scale_fill_gradient(low = "white", high = "steelblue") +
+                geom_text(aes(x = Reference, y = Prediction, label = Freq)) +
+                theme(legend.position = "none") +
+                ggtitle(paste(model, "Accuracy", percent_format()(cfm$overall[1]),
+                              "Kappa", percent_format()(cfm$overall[2])))
+        return(plot)
+}
+
+# Read data
+
+training = 
+        fread("/home/clay/Skole/JHU_Data_Science/Practical_Machine_Learning/Final_Project/pml-training.csv")
+
+testing = 
+        fread("/home/clay/Skole/JHU_Data_Science/Practical_Machine_Learning/Final_Project/pml-testing.csv")
+```
+## Exploratory Data Analysis
+
+(Please see final_project.R for the full code.)
+
+Training and testing data sets are given by the HAR project, but the test set  
+is only 20 observations. We'll use this to test our final model, but we'll need  
+to split the training set in order to build the model. We create a data part-  
+ition from the training data set and call these newTrain and newTest in order to  
+avoid confusion. Further, since we may want to ensemble our models, we create a  
+third partition (valid) for validation. We give newTrain 70% of the training  
+data and 15% each to newTest and valid.
+<br><br>
+A first look at the data shows that most of the variables are statistical  
+rather than observational. We subset out the statistical data from all three  
+partitions so that we are working only with the observational data.
+
+```{r chunk2, echo = FALSE}
+set.seed(2276)
+newPart = createDataPartition(training$classe, p = 0.7, list = FALSE)
+newTrain = training[newPart]
+tempPart = training[-newPart]
+splitTempPart = createDataPartition(tempPart$classe, p = 0.5, list = FALSE)
+newTest = tempPart[splitTempPart]
+valid = tempPart[-splitTempPart]
+
+newTest = newTest %>% select(-V1, -user_name, -contains("timestamp"),
+-contains("window"), -contains("kurtosis"), -contains("skewness"),
+-contains("max"), -contains("min"), -contains("amplitude"), -contains("avg"),
+-contains("stddev"), -contains("var"))
+newTrain = newTrain %>% select(-V1, -user_name, -contains("timestamp"),
+-contains("window"), -contains("kurtosis"), -contains("skewness"),
+-contains("max"), -contains("min"), -contains("amplitude"), -contains("avg"),
+-contains("stddev"), -contains("var"))
+valid = valid %>% select(-V1, -user_name, -contains("timestamp"),
+-contains("window"), -contains("kurtosis"), -contains("skewness"),
+-contains("max"), -contains("min"), -contains("amplitude"), -contains("avg"),
+-contains("stddev"), -contains("var"))
+```
+
+### Principle Component Analysis
+We've reduced the number of variables from 160 to 53. We now try principle com-  
+ponent analysis as a way of getting an accurate but more parsimonious data set.
+<br>  
+Unfortunately, the results are not helpful.
+
+```{r chunk3, echo = FALSE}
+preProc = preProcess(newTrain[,-53], method="pca", pcaComp=5)
+trainPCA = predict(preProc, newTrain[,-53])
+trainPCA = cbind(trainPCA, as.factor(newTrain$classe))
+trainPCA = trainPCA %>% rename(classe = V2)
+plot5 = ggplot(trainPCA, aes(x = PC1,  y = PC2, color = classe)) +
+        geom_point() +
+        scale_color_brewer(palette = "Paired")
+plot5
+```
+
+### Highly Correlated Predictors
+
+PCA provides no separation between the categories. It may be that we will need  
+all 53 observational variables, but if at all possible we'd like to reduce  
+computational complexity before building our models. We check correlations  
+between the variables. 
+
+```{r chunk4, echo = FALSE}
+correlations = cor(newTrain[,-53], method = "pearson")
+highCorCols = colnames(newTrain)[findCorrelation(correlations, cutoff = 0.75,
+                                              verbose = FALSE)]
+print(noquote("Highly correlated variables:"))
+highCorCols
+```
+
+And in fact 18 of the variables are correlated at .75 or greater. We remove  
+these from our data sets and now work with a somewhat more manageable set of 32  
+predictors.
+
+```{r chunk5, echo = FALSE, include = FALSE}
+newTrain = newTrain %>% select(-accel_belt_z, -roll_belt, -accel_belt_y,
+                         -accel_arm_y, -total_accel_belt, -accel_dumbbell_z,
+                         -accel_belt_x, -pitch_belt, -magnet_dumbbell_x,
+                         -accel_dumbbell_y, -magnet_dumbbell_y, -accel_arm_x,
+                         -accel_dumbbell_x, accel_arm_z, -magnet_arm_y,
+                         -magnet_belt_z, -accel_forearm_y, -gyros_forearm_y,
+                         -gyros_dumbbell_x, -gyros_dumbbell_z,-gyros_arm_x)
+newTest = newTest %>% select(-accel_belt_z, -roll_belt, -accel_belt_y,
+                         -accel_arm_y, -total_accel_belt, -accel_dumbbell_z,
+                         -accel_belt_x, -pitch_belt, -magnet_dumbbell_x,
+                         -accel_dumbbell_y, -magnet_dumbbell_y, -accel_arm_x,
+                         -accel_dumbbell_x, accel_arm_z, -magnet_arm_y,
+                         -magnet_belt_z, -accel_forearm_y, -gyros_forearm_y,
+                         -gyros_dumbbell_x, -gyros_dumbbell_z,-gyros_arm_x)
+valid = valid %>% select(-accel_belt_z, -roll_belt, -accel_belt_y,
+                         -accel_arm_y, -total_accel_belt, -accel_dumbbell_z,
+                         -accel_belt_x, -pitch_belt, -magnet_dumbbell_x,
+                         -accel_dumbbell_y, -magnet_dumbbell_y, -accel_arm_x,
+                         -accel_dumbbell_x, accel_arm_z, -magnet_arm_y,
+                         -magnet_belt_z, -accel_forearm_y, -gyros_forearm_y,
+                         -gyros_dumbbell_x, -gyros_dumbbell_z,-gyros_arm_x)
+newTest = newTest[1:2942]
+```
+
+## Model Building
+
+### Cross-Validation
+We've chosen to use 10-fold cross validation as a compromise between bias and  
+variance. We could also have used 5-fold, but we have some concern with over-  
+fitting and hope to avoid this with more robust cross-validation.
+
+### Choice of Algorithm
+While we have no particular reason to choose one algorithm over all the others,  
+some are more typically used for classification, and we'll fit several models  
+for purposes of comparison. We'll look at (alphabetically) Gradient Boosting,   
+K-nearest Neighbors, Naive Bayes, Random Forest, and Treebagging.  
+
+Summary of results:
+```{r, chunk6, echo = FALSE, warning = FALSE}
+set.seed(2261)
+tC = trainControl(method="cv", number=10, savePredictions = "all", 
+                  classProbs=TRUE)
+rfFit = train(classe ~ ., data = newTrain,  method="rf", trControl=tC)
+gbmFit = train(classe ~ ., data = newTrain, method = "gbm", trControl = tC, 
+               verbose = FALSE)
+tbagFit = train(classe ~ ., data = newTrain, method = "treebag", trControl = tC)
+nbFit = train(classe ~ ., data = newTrain, method = "nb", trControl = tC)
+knnFit = train(classe ~ ., data = newTrain, method = "knn", trControl = tC)
+
+results = resamples(list(GBM = gbmFit, KNN = knnFit, NB = nbFit, RF = rfFit,
+                         TBAG = tbagFit))
+summary(results)
+```
+
+K-nearest Neighbors and Naive Bayes are poor performers; we won't consider them  
+further.  
+
+The accuracy for the random forest model is > .99. It's hard to imagine that we  
+will gain much by stacking, but let's look at the correlations between the  
+models.
+
+```{r chunk7, echo = FALSE}
+modelCor(results)
+```
+
+The correlations between the three best-performing algorithms is quite low.  
+Stacking may provide even greater accuracy. We combine the models and create a  
+new one using random forest, first creating a level-one data set from the  
+single-model predictions on the valid data set in order to train the stacked  
+model. Once this is done we can examine confusion matrices for all four models.
+
+```{r, chunk9, warning = FALSE, echo = FALSE}
+rfPredict = predict(rfFit, newdata = valid)
+gbmPredict = predict(gbmFit, newdata = valid)
+tbagPredict = predict(tbagFit, newdata = valid)
+
+predDF = data.frame(rfPredict, gbmPredict, tbagPredict, classe =
+                            as.factor(valid$classe))
+stackFit = train(classe ~ ., method="rf", data = predDF)
+
+testRfPredict = predict(rfFit, newdata = newTest)
+testGbmPredict = predict(gbmFit, newdata = newTest)
+testTbagPredict = predict(tbagFit, newdata = newTest)
+
+testPredDF = data.frame(testRfPredict, testGbmPredict, testTbagPredict,
+                        classe = as.factor(newTest$classe))
+stackPredict = predict(stackFit, testPredDF)
+
+testRfConfusion = confusionMatrix(testRfPredict, as.factor(newTest$classe))
+testGbmConfusion = confusionMatrix(testGbmPredict, as.factor(newTest$classe))
+testTbagConfusion = confusionMatrix(testTbagPredict, as.factor(newTest$classe))
+testStackConfusion = confusionMatrix(stackPredict, as.factor(newTest$classe))
+
+con1 = conMatPlot(testRfConfusion, "RF: ")
+con2 = conMatPlot(testGbmConfusion, "GBM: ")
+con3 = conMatPlot(testTbagConfusion, "TBAG: ")
+con4 = conMatPlot(testStackConfusion, "Stacked: ")
+
+plot_grid(con1, con2, con3, con4)
+```
+
+## Estimating Out-of-Sample Error
+
+Using caret's multiclass summary function we can estimate out-of-sample error and  
+compare other measures:
+
+Random Forest:
+
+```{r, chunk10, echo = FALSE}
+lev = c("A", "B", "C", "D", "E")
+dat1 = data.frame(obs = as.factor(newTest$classe), pred = testRfPredict)
+multiClassSummary(dat1, lev = lev)
+```
+
+Stacked Model:
+```{r, chunk10.1, echo = FALSE}
+dat2 = data.frame(obs = as.factor(newTest$classe), pred = stackPredict)
+multiClassSummary(dat2, lev= lev)
+```
+
+With so little difference between the two models, we choose the simpler random  
+forest as our final model.
+
+### Testing
+
+Finally, we apply our model against the testing data set of 20 observations.
+
+```{r, chunk11, warning = FALSE}
+rfFinalPredict = predict(rfFit, testing)
+rfFinalPredict
+```
